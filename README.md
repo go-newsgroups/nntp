@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-newsgroups/brand/main/social/go-newsgroups.png" alt="go-newsgroups/nntp" width="720"></p>
+
 # nntp
 
 [![CI](https://github.com/go-newsgroups/nntp/actions/workflows/ci.yml/badge.svg)](https://github.com/go-newsgroups/nntp/actions/workflows/ci.yml)
