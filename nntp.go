@@ -9,6 +9,7 @@ package nntp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/textproto"
@@ -19,9 +20,34 @@ import (
 
 // Conn is a connection to an NNTP server. It wraps a *textproto.Conn layered
 // over the underlying net.Conn. A Conn is not safe for concurrent use.
+//
+// Conn transparently bridges legacy NNRP servers (which predate RFC 3977 and
+// reject CAPABILITIES) and modern servers (INN and the like). Capability
+// negotiation is performed lazily and cached; see Capabilities, HasCapability
+// and Legacy.
 type Conn struct {
 	conn net.Conn
 	text *textproto.Conn
+
+	// caps holds the upper-cased first token of every advertised capability
+	// line (e.g. "OVER", "AUTHINFO", "COMPRESS"). It is nil in legacy mode.
+	caps map[string]bool
+	// legacy is true once negotiation found the server does not implement
+	// CAPABILITIES (an RFC 3977 predecessor such as classic NNRP).
+	legacy bool
+	// negotiated records whether capability negotiation has run since the
+	// last connect or AUTHINFO exchange, so it happens at most once per state.
+	negotiated bool
+}
+
+// codeOf extracts the NNTP status code carried by a *textproto.Error, or 0 for
+// any other (e.g. network) error.
+func codeOf(err error) int {
+	var te *textproto.Error
+	if errors.As(err, &te) {
+		return te.Code
+	}
+	return 0
 }
 
 // ensurePort returns addr unchanged if it already carries a port, otherwise it
@@ -96,6 +122,7 @@ func (c *Conn) Authenticate(user, pass string) error {
 	}
 	switch code {
 	case 281: // accepted without password
+		c.negotiated = false // capabilities may change post-auth (RFC 3977 §5.3)
 		return nil
 	case 381: // password required, continue
 	default:
@@ -106,9 +133,109 @@ func (c *Conn) Authenticate(user, pass string) error {
 		return err
 	}
 	if code == 281 {
+		c.negotiated = false // capabilities may change post-auth (RFC 3977 §5.3)
 		return nil
 	}
 	return fmt.Errorf("nntp: AUTHINFO PASS rejected code %d: %s", code, msg)
+}
+
+// Capabilities issues the CAPABILITIES command (RFC 3977 §5.2) and returns the
+// raw capability lines advertised by the server (for example "VERSION 2",
+// "AUTHINFO USER", "COMPRESS DEFLATE").
+//
+// Legacy servers that predate RFC 3977 reject the command with 500, 501 or 480
+// (authentication required first). That is not treated as an error: Capabilities
+// then returns an empty slice with a nil error and the connection enters legacy
+// mode (see Legacy). The negotiated set is cached and reused by HasCapability
+// and Legacy; it is refreshed after a successful AUTHINFO exchange, since a
+// server may advertise different capabilities once the client is authenticated.
+func (c *Conn) Capabilities() ([]string, error) {
+	id, _ := c.text.Cmd("CAPABILITIES")
+	c.text.StartResponse(id)
+	defer c.text.EndResponse(id)
+	if _, _, err := c.text.ReadCodeLine(101); err != nil {
+		switch codeOf(err) {
+		case 500, 501, 480: // unknown/unsupported command, or auth-first: legacy
+			c.caps = nil
+			c.legacy = true
+			c.negotiated = true
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	lines, err := c.text.ReadDotLines()
+	if err != nil {
+		return nil, err
+	}
+	c.caps = make(map[string]bool, len(lines))
+	for _, l := range lines {
+		f := strings.Fields(l)
+		if len(f) == 0 {
+			continue
+		}
+		c.caps[strings.ToUpper(f[0])] = true
+	}
+	c.legacy = false
+	c.negotiated = true
+	return lines, nil
+}
+
+// TODO(compress): a server advertising COMPRESS DEFLATE (detectable via
+// HasCapability("COMPRESS")) supports RFC 8054 compressed streaming. Actually
+// negotiating COMPRESS DEFLATE and wrapping the transport in a flate reader/
+// writer is a larger change left as a future enhancement; only detection is
+// provided here.
+
+// negotiate runs capability negotiation once and caches the result. Subsequent
+// calls are no-ops until the connection state changes (e.g. after AUTHINFO).
+func (c *Conn) negotiate() error {
+	if c.negotiated {
+		return nil
+	}
+	_, err := c.Capabilities()
+	return err
+}
+
+// HasCapability reports whether the server advertised the named capability
+// (matched case-insensitively against the first token of each capability line,
+// e.g. "OVER", "HDR", "READER", "POST", "AUTHINFO", "COMPRESS"). It negotiates
+// lazily on first use and returns false in legacy mode or if negotiation fails.
+func (c *Conn) HasCapability(name string) bool {
+	if c.negotiate() != nil {
+		return false
+	}
+	return c.caps[strings.ToUpper(name)]
+}
+
+// Legacy reports whether the server does not implement CAPABILITIES (RFC 3977)
+// and is therefore driven in legacy NNRP mode. It negotiates lazily on first
+// use.
+func (c *Conn) Legacy() bool {
+	_ = c.negotiate()
+	return c.legacy
+}
+
+// ModeReader issues MODE READER (RFC 3977 §5.3), which some servers require
+// before they enable reader commands. A 200 (posting allowed) or 201 (posting
+// prohibited) reply is a success. Servers that do not implement the command
+// answer 500/501; that is tolerated and treated as a no-op success, so calling
+// ModeReader is always safe, including on servers that already greet in reader
+// mode. Dial does not send MODE READER automatically, to preserve the exact
+// on-the-wire behaviour existing callers rely on; call it explicitly when
+// targeting a server that gates reader commands behind it.
+func (c *Conn) ModeReader() error {
+	code, msg, err := c.simpleCmd(0, "MODE READER")
+	if err != nil {
+		return err
+	}
+	switch code {
+	case 200, 201: // reader mode active (posting allowed / prohibited)
+		return nil
+	case 500, 501: // not implemented: treat as a no-op success
+		return nil
+	default:
+		return fmt.Errorf("nntp: MODE READER unexpected code %d: %s", code, msg)
+	}
 }
 
 // Group is the result of selecting a newsgroup with GROUP.
@@ -183,11 +310,18 @@ func parseDate(s string) time.Time {
 }
 
 // Over returns the overview (header summaries) for the inclusive article range
-// low-high in the currently selected group, via the OVER command.
+// low-high in the currently selected group. It uses the RFC 3977 OVER command
+// and, if the server rejects it as unknown (500/501), transparently falls back
+// to the legacy XOVER command, which has an identical response format.
 func (c *Conn) Over(low, high int) ([]Overview, error) {
 	lines, err := c.multiCmd(224, "OVER %d-%d", low, high)
 	if err != nil {
-		return nil, err
+		if code := codeOf(err); code == 500 || code == 501 {
+			lines, err = c.multiCmd(224, "XOVER %d-%d", low, high)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	out := make([]Overview, 0, len(lines))
 	for _, line := range lines {

@@ -433,3 +433,228 @@ func TestAuthenticate(t *testing.T) {
 		}
 	})
 }
+
+// modernCaps is a representative INN CAPABILITIES reply.
+const modernCaps = "101 Capability list:\r\n" +
+	"VERSION 2\r\n" +
+	"READER\r\n" +
+	"OVER\r\n" +
+	"HDR\r\n" +
+	"POST\r\n" +
+	"AUTHINFO USER\r\n" +
+	"COMPRESS DEFLATE\r\n" +
+	"LIST ACTIVE NEWSGROUPS\r\n" +
+	"\r\n" + // blank line: must be skipped, not indexed
+	".\r\n"
+
+func TestCapabilitiesModern(t *testing.T) {
+	c := dial(t, okGreeting, func(line string) (string, bool) {
+		switch line {
+		case "CAPABILITIES":
+			return modernCaps, false
+		case "QUIT":
+			return "205 bye\r\n", true
+		}
+		return "500 unknown\r\n", false
+	})
+
+	caps, err := c.Capabilities()
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	// Raw lines are returned verbatim (the trailing blank line included); it is
+	// only the capability set consulted by HasCapability that skips blanks.
+	if len(caps) != 9 {
+		t.Fatalf("Capabilities returned %d lines, want 9: %v", len(caps), caps)
+	}
+	if caps[0] != "VERSION 2" {
+		t.Errorf("caps[0] = %q, want %q", caps[0], "VERSION 2")
+	}
+	if c.Legacy() {
+		t.Error("Legacy() = true on modern server")
+	}
+	for _, name := range []string{"version", "READER", "over", "HDR", "post", "authinfo", "compress"} {
+		if !c.HasCapability(name) {
+			t.Errorf("HasCapability(%q) = false, want true", name)
+		}
+	}
+	if c.HasCapability("STARTTLS") {
+		t.Error("HasCapability(STARTTLS) = true, want false")
+	}
+}
+
+func TestCapabilitiesLegacy(t *testing.T) {
+	for _, code := range []string{"500", "501", "480"} {
+		t.Run(code, func(t *testing.T) {
+			c := dial(t, okGreeting, func(line string) (string, bool) {
+				switch line {
+				case "CAPABILITIES":
+					return code + " What?\r\n", false
+				case "QUIT":
+					return "205 bye\r\n", true
+				}
+				return "500 unknown\r\n", false
+			})
+			caps, err := c.Capabilities()
+			if err != nil {
+				t.Fatalf("Capabilities: %v", err)
+			}
+			if caps == nil || len(caps) != 0 {
+				t.Errorf("Capabilities = %v, want empty non-nil slice", caps)
+			}
+			if !c.Legacy() {
+				t.Error("Legacy() = false, want true")
+			}
+			if c.HasCapability("OVER") {
+				t.Error("HasCapability(OVER) = true in legacy mode")
+			}
+		})
+	}
+}
+
+func TestCapabilitiesErrors(t *testing.T) {
+	t.Run("read-error", func(t *testing.T) {
+		// Close immediately: CAPABILITIES gets no status line at all.
+		c := dial(t, okGreeting, func(string) (string, bool) { return "", true })
+		if _, err := c.Capabilities(); err == nil {
+			t.Fatal("expected read error")
+		}
+		// Lazy accessors swallow the error and report the safe default.
+		if c.HasCapability("OVER") {
+			t.Error("HasCapability = true after negotiation failure")
+		}
+		if c.Legacy() {
+			t.Error("Legacy = true after negotiation failure")
+		}
+	})
+	t.Run("truncated-block", func(t *testing.T) {
+		// 101 status line then EOF before the dot terminator.
+		c := dial(t, okGreeting, func(string) (string, bool) {
+			return "101 caps follow\r\nVERSION 2\r\n", true
+		})
+		if _, err := c.Capabilities(); err == nil {
+			t.Fatal("expected error on truncated block")
+		}
+	})
+}
+
+func TestNegotiateCached(t *testing.T) {
+	var count int
+	c := dial(t, okGreeting, func(line string) (string, bool) {
+		switch line {
+		case "CAPABILITIES":
+			count++
+			return modernCaps, false
+		case "QUIT":
+			return "205 bye\r\n", true
+		}
+		return "500 unknown\r\n", false
+	})
+	// Two lazy lookups must trigger exactly one CAPABILITIES exchange.
+	if !c.HasCapability("OVER") || c.Legacy() {
+		t.Fatal("unexpected negotiation result")
+	}
+	if count != 1 {
+		t.Fatalf("CAPABILITIES sent %d times, want 1", count)
+	}
+}
+
+func TestNegotiateAfterAuth(t *testing.T) {
+	var count int
+	c := dial(t, okGreeting, func(line string) (string, bool) {
+		switch {
+		case line == "CAPABILITIES":
+			count++
+			return modernCaps, false
+		case strings.HasPrefix(line, "AUTHINFO USER"):
+			return "281 authenticated\r\n", false
+		case line == "QUIT":
+			return "205 bye\r\n", true
+		}
+		return "500 unknown\r\n", false
+	})
+	if !c.HasCapability("OVER") {
+		t.Fatal("HasCapability(OVER) = false before auth")
+	}
+	if err := c.Authenticate("bob", "secret"); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	// Authentication invalidates the cache; the next lookup re-negotiates.
+	if !c.HasCapability("READER") {
+		t.Fatal("HasCapability(READER) = false after auth")
+	}
+	if count != 2 {
+		t.Fatalf("CAPABILITIES sent %d times, want 2 (once per auth state)", count)
+	}
+}
+
+func TestModeReader(t *testing.T) {
+	cases := []struct {
+		name    string
+		reply   string
+		wantErr bool
+	}{
+		{"posting-allowed", "200 reader mode, posting allowed\r\n", false},
+		{"posting-prohibited", "201 reader mode, posting prohibited\r\n", false},
+		{"not-implemented", "500 unknown command\r\n", false},
+		{"not-implemented-501", "501 not supported\r\n", false},
+		{"unexpected", "400 service discontinued\r\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := dial(t, okGreeting, func(line string) (string, bool) {
+				if line == "QUIT" {
+					return "205 bye\r\n", true
+				}
+				return tc.reply, false
+			})
+			err := c.ModeReader()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("ModeReader err = %v, wantErr = %v", err, tc.wantErr)
+			}
+		})
+	}
+	t.Run("read-error", func(t *testing.T) {
+		c := dial(t, okGreeting, func(string) (string, bool) { return "", true })
+		if err := c.ModeReader(); err == nil {
+			t.Fatal("expected read error")
+		}
+	})
+}
+
+func TestOverXOVERFallback(t *testing.T) {
+	t.Run("fallback-success", func(t *testing.T) {
+		c := dial(t, okGreeting, func(line string) (string, bool) {
+			switch {
+			case strings.HasPrefix(line, "OVER"):
+				return "500 unknown command\r\n", false
+			case strings.HasPrefix(line, "XOVER"):
+				return "224 overview follows\r\n" +
+					"1\tHello\tAlice <a@x>\tMon, 02 Jan 2006 15:04:05 -0700\t<1@x>\t\t512\t7\r\n" +
+					".\r\n", false
+			case line == "QUIT":
+				return "205 bye\r\n", true
+			}
+			return "500 unknown\r\n", false
+		})
+		ov, err := c.Over(1, 2)
+		if err != nil {
+			t.Fatalf("Over: %v", err)
+		}
+		if len(ov) != 1 || ov[0].Subject != "Hello" {
+			t.Fatalf("Over = %+v", ov)
+		}
+	})
+	t.Run("fallback-also-fails", func(t *testing.T) {
+		c := dial(t, okGreeting, func(line string) (string, bool) {
+			if line == "QUIT" {
+				return "205 bye\r\n", true
+			}
+			// Both OVER and XOVER are rejected.
+			return "501 command syntax error\r\n", false
+		})
+		if _, err := c.Over(1, 2); err == nil {
+			t.Fatal("expected error when XOVER fallback also fails")
+		}
+	})
+}

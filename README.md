@@ -12,8 +12,26 @@ library (`net`, `net/textproto`, `crypto/tls`, ...), builds with `CGO_ENABLED=0`
 and pulls in **zero third-party dependencies**.
 
 Supported operations: connect (plaintext or implicit TLS), `AUTHINFO`
-authentication, `GROUP` selection, `OVER` overview retrieval, `ARTICLE`
-fetching, and `LIST ACTIVE` newsgroup enumeration.
+authentication, `CAPABILITIES` negotiation, `MODE READER`, `GROUP` selection,
+`OVER` overview retrieval (with automatic `XOVER` fallback), `ARTICLE` fetching,
+and `LIST ACTIVE` newsgroup enumeration.
+
+### Legacy and modern servers
+
+The client works against both ancient NNRP servers that predate
+[RFC 3977](https://www.rfc-editor.org/rfc/rfc3977) and modern servers such as
+INN. `CAPABILITIES` is negotiated lazily and cached (and refreshed after
+`AUTHINFO`, since a server may advertise different capabilities once
+authenticated). A server that rejects `CAPABILITIES` is driven in *legacy mode*
+rather than treated as an error, and `Over` transparently falls back from `OVER`
+to the legacy `XOVER` command when the former is unknown.
+
+```go
+caps, _ := c.Capabilities()        // raw advertised capability lines (empty on legacy servers)
+if c.Legacy() { /* pre-RFC-3977 server */ }
+if c.HasCapability("OVER") { /* modern overview support */ }
+_ = c.ModeReader()                 // enable reader commands where required (safe no-op elsewhere)
+```
 
 ## Install
 
@@ -74,9 +92,13 @@ func main() {
 | Method | NNTP command | Purpose |
 | ------ | ------------ | ------- |
 | `Dial` / `DialTLS` | — | Connect (plaintext / implicit TLS) and read the greeting |
-| `Authenticate` | `AUTHINFO USER`/`PASS` | Authenticate |
+| `Authenticate` | `AUTHINFO USER`/`PASS` | Authenticate (invalidates the cached capability set) |
+| `Capabilities` | `CAPABILITIES` | Negotiate and return advertised capabilities (empty on legacy servers) |
+| `HasCapability` | — | Case-insensitive check against the negotiated capability set |
+| `Legacy` | — | Report whether the server predates `CAPABILITIES` (RFC 3977) |
+| `ModeReader` | `MODE READER` | Switch to reader mode (tolerant no-op where unsupported) |
 | `Group` | `GROUP` | Select a newsgroup |
-| `Over` | `OVER` | Fetch article header summaries for a range |
+| `Over` | `OVER` (→ `XOVER`) | Fetch article header summaries for a range, with legacy fallback |
 | `Article` | `ARTICLE` | Fetch a full article by message-id or number |
 | `List` | `LIST ACTIVE` | Enumerate newsgroups (optional wildmat filter) |
 | `Close` | `QUIT` | Close the connection |
