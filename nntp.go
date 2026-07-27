@@ -96,7 +96,10 @@ func newConn(nc net.Conn) (*Conn, error) {
 // simpleCmd sends a single command and reads a single status line, returning
 // its code and message. expect follows textproto.ReadCodeLine semantics.
 func (c *Conn) simpleCmd(expect int, format string, args ...any) (int, string, error) {
-	id, _ := c.text.Cmd(format, args...)
+	id, err := c.text.Cmd(format, args...)
+	if err != nil {
+		return 0, "", err
+	}
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
 	return c.text.ReadCodeLine(expect)
@@ -105,7 +108,10 @@ func (c *Conn) simpleCmd(expect int, format string, args ...any) (int, string, e
 // multiCmd sends a command whose response is a status line followed by a
 // dot-terminated multiline block, and returns the block's lines.
 func (c *Conn) multiCmd(expect int, format string, args ...any) ([]string, error) {
-	id, _ := c.text.Cmd(format, args...)
+	id, err := c.text.Cmd(format, args...)
+	if err != nil {
+		return nil, err
+	}
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
 	if _, _, err := c.text.ReadCodeLine(expect); err != nil {
@@ -150,7 +156,10 @@ func (c *Conn) Authenticate(user, pass string) error {
 // and Legacy; it is refreshed after a successful AUTHINFO exchange, since a
 // server may advertise different capabilities once the client is authenticated.
 func (c *Conn) Capabilities() ([]string, error) {
-	id, _ := c.text.Cmd("CAPABILITIES")
+	id, err := c.text.Cmd("CAPABILITIES")
+	if err != nil {
+		return nil, err
+	}
 	c.text.StartResponse(id)
 	defer c.text.EndResponse(id)
 	if _, _, err := c.text.ReadCodeLine(101); err != nil {
@@ -413,9 +422,10 @@ func (c *Conn) List(wildmat string) ([]NewsgroupInfo, error) {
 
 // Close sends QUIT (best effort) and closes the underlying connection.
 func (c *Conn) Close() error {
-	id, _ := c.text.Cmd("QUIT")
-	c.text.StartResponse(id)
-	_, _, _ = c.text.ReadCodeLine(205)
-	c.text.EndResponse(id)
+	if id, err := c.text.Cmd("QUIT"); err == nil {
+		c.text.StartResponse(id)
+		_, _, _ = c.text.ReadCodeLine(205)
+		c.text.EndResponse(id)
+	}
 	return c.text.Close()
 }

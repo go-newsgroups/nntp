@@ -622,6 +622,30 @@ func TestModeReader(t *testing.T) {
 	})
 }
 
+func TestCommandsAfterClose(t *testing.T) {
+	// Closing the underlying connection makes every subsequent command's write
+	// fail deterministically, exercising the Cmd write-error guards in the
+	// shared helpers (a naive StartResponse on the failed id would otherwise
+	// deadlock the textproto response pipeline).
+	newDead := func() *Conn {
+		c := dial(t, okGreeting, func(string) (string, bool) { return "500 x\r\n", false })
+		c.conn.Close()
+		return c
+	}
+	if err := newDead().ModeReader(); err == nil { // simpleCmd path
+		t.Error("ModeReader: expected error after close")
+	}
+	if _, err := newDead().Over(1, 2); err == nil { // multiCmd path
+		t.Error("Over: expected error after close")
+	}
+	if _, err := newDead().Capabilities(); err == nil {
+		t.Error("Capabilities: expected error after close")
+	}
+	if err := newDead().Close(); err == nil { // QUIT write fails, still closes
+		t.Error("Close: expected error after close")
+	}
+}
+
 func TestOverXOVERFallback(t *testing.T) {
 	t.Run("fallback-success", func(t *testing.T) {
 		c := dial(t, okGreeting, func(line string) (string, bool) {
