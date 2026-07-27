@@ -682,3 +682,18 @@ func TestOverXOVERFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestParseDateTwoDigitYear(t *testing.T) {
+	// Legacy RFC 822 2-digit-year date used by Free's alt.binaries.* servers.
+	got := parseDate("Tue, 07 Jul 26 11:13:37 UTC")
+	if got.IsZero() {
+		t.Fatal("2-digit-year date parsed to the zero time")
+	}
+	if got.Year() != 2026 || got.Month() != 7 || got.Day() != 7 {
+		t.Fatalf("parsed = %v, want 2026-07-07", got.Format("2006-01-02"))
+	}
+	// A genuinely malformed date still yields the zero time.
+	if !parseDate("not a date").IsZero() {
+		t.Fatal("garbage date should be zero")
+	}
+}

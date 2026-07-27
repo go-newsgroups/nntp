@@ -294,10 +294,18 @@ type Overview struct {
 }
 
 // overDateLayouts are tried, in order, when parsing an overview Date field.
+// Besides the modern 4-digit-year RFC 1123 forms, many servers (e.g. Free's
+// alt.binaries.*) still emit the legacy 2-digit-year RFC 822 date
+// ("Tue, 07 Jul 26 11:13:37 UTC"), so those layouts are included too — without
+// them the date silently parses to the zero time and the article sorts as if
+// from year 1.
 var overDateLayouts = []string{
 	time.RFC1123Z,
 	time.RFC1123,
 	"02 Jan 2006 15:04:05 -0700",
+	"Mon, 02 Jan 06 15:04:05 MST",
+	"Mon, 02 Jan 06 15:04:05 -0700",
+	"02 Jan 06 15:04:05 MST",
 }
 
 // parseInt parses a base-10 integer, returning 0 for any malformed input.
