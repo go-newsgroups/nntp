@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-datetime/dates"
 )
 
 // Conn is a connection to an NNTP server. It wraps a *textproto.Conn layered
@@ -293,37 +295,19 @@ type Overview struct {
 	Lines      int
 }
 
-// overDateLayouts are tried, in order, when parsing an overview Date field.
-// Besides the modern 4-digit-year RFC 1123 forms, many servers (e.g. Free's
-// alt.binaries.*) still emit the legacy 2-digit-year RFC 822 date
-// ("Tue, 07 Jul 26 11:13:37 UTC"), so those layouts are included too — without
-// them the date silently parses to the zero time and the article sorts as if
-// from year 1.
-var overDateLayouts = []string{
-	time.RFC1123Z,
-	time.RFC1123,
-	"02 Jan 2006 15:04:05 -0700",
-	"Mon, 02 Jan 06 15:04:05 MST",
-	"Mon, 02 Jan 06 15:04:05 -0700",
-	"02 Jan 06 15:04:05 MST",
-}
-
 // parseInt parses a base-10 integer, returning 0 for any malformed input.
 func parseInt(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))
 	return n
 }
 
-// parseDate parses a date using the known overview layouts, returning the zero
-// time.Time if none match.
+// parseDate parses an overview Date field, returning the zero time.Time when it
+// can't be understood. The messy real-world format zoo (RFC 1123/822, 2-digit
+// years, named-zone offsets like "... UTC"/"... EST") is handled by the shared
+// go-datetime/dates parser so every fleet consumer benefits from one table.
 func parseDate(s string) time.Time {
-	s = strings.TrimSpace(s)
-	for _, layout := range overDateLayouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
+	t, _ := dates.Parse(s)
+	return t
 }
 
 // Over returns the overview (header summaries) for the inclusive article range
